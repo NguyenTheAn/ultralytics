@@ -128,7 +128,17 @@ class Detect(nn.Module):
         else:
             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        grid_h = shape[2]
+        grid_w = shape[3]
+        grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+        norm = self.strides / (self.stride[0] * grid_size)
+        np.save("anchors.npy", self.anchors.numpy())
+        np.save("strides.npy", self.strides.numpy())
+        np.savetxt("anchors.csv", self.anchors.cpu().numpy(), delimiter=",")
+        np.savetxt("strides.csv", self.strides.cpu().numpy(), delimiter=",")
+        np.savetxt("norm.csv", norm.cpu().numpy(), delimiter=",")
+        # return torch.cat((dbox, cls.sigmoid()), 1)
+        return self.dfl(box), cls.sigmoid()
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -247,6 +257,7 @@ class Pose(Detect):
         if self.training:
             return x, kpt
         pred_kpt = self.kpts_decode(bs, kpt)
+        return x, kpt
         return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
 
     def kpts_decode(self, bs, kpts):

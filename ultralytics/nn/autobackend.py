@@ -16,6 +16,7 @@ from PIL import Image
 from ultralytics.utils import ARM64, IS_JETSON, IS_RASPBERRYPI, LINUX, LOGGER, ROOT, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_version, check_yaml
 from ultralytics.utils.downloads import attempt_download_asset, is_url
+from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
 
 def check_class_names(names):
@@ -59,22 +60,21 @@ class AutoBackend(nn.Module):
     range of formats, each with specific naming conventions as outlined below:
 
         Supported Formats and Naming Conventions:
-            | Format                | File Suffix       |
-            |-----------------------|-------------------|
-            | PyTorch               | *.pt              |
-            | TorchScript           | *.torchscript     |
-            | ONNX Runtime          | *.onnx            |
-            | ONNX OpenCV DNN       | *.onnx (dnn=True) |
-            | OpenVINO              | *openvino_model/  |
-            | CoreML                | *.mlpackage       |
-            | TensorRT              | *.engine          |
-            | TensorFlow SavedModel | *_saved_model/    |
-            | TensorFlow GraphDef   | *.pb              |
-            | TensorFlow Lite       | *.tflite          |
-            | TensorFlow Edge TPU   | *_edgetpu.tflite  |
-            | PaddlePaddle          | *_paddle_model/   |
-            | MNN                   | *.mnn             |
-            | NCNN                  | *_ncnn_model/     |
+            | Format                | File Suffix      |
+            |-----------------------|------------------|
+            | PyTorch               | *.pt             |
+            | TorchScript           | *.torchscript    |
+            | ONNX Runtime          | *.onnx           |
+            | ONNX OpenCV DNN       | *.onnx (dnn=True)|
+            | OpenVINO              | *openvino_model/ |
+            | CoreML                | *.mlpackage      |
+            | TensorRT              | *.engine         |
+            | TensorFlow SavedModel | *_saved_model    |
+            | TensorFlow GraphDef   | *.pb             |
+            | TensorFlow Lite       | *.tflite         |
+            | TensorFlow Edge TPU   | *_edgetpu.tflite |
+            | PaddlePaddle          | *_paddle_model   |
+            | NCNN                  | *_ncnn_model     |
 
     This class offers dynamic backend switching capabilities based on the input model format, making it easier to deploy
     models across various platforms.
@@ -121,9 +121,7 @@ class AutoBackend(nn.Module):
             edgetpu,
             tfjs,
             paddle,
-            mnn,
             ncnn,
-            imx,
             triton,
         ) = self._model_type(w)
         fp16 &= pt or jit or onnx or xml or engine or nn_module or triton  # FP16
@@ -183,8 +181,8 @@ class AutoBackend(nn.Module):
             check_requirements("opencv-python>=4.5.4")
             net = cv2.dnn.readNetFromONNX(w)
 
-        # ONNX Runtime and IMX
-        elif onnx or imx:
+        # ONNX Runtime
+        elif onnx:
             LOGGER.info(f"Loading {w} for ONNX Runtime inference...")
             check_requirements(("onnx", "onnxruntime-gpu" if cuda else "onnxruntime"))
             if IS_RASPBERRYPI or IS_JETSON:
@@ -192,47 +190,10 @@ class AutoBackend(nn.Module):
                 check_requirements("numpy==1.23.5")
             import onnxruntime
 
-            providers = onnxruntime.get_available_providers()
-            if not cuda and "CUDAExecutionProvider" in providers:
-                providers.remove("CUDAExecutionProvider")
-            elif cuda and "CUDAExecutionProvider" not in providers:
-                LOGGER.warning("WARNING ⚠️ Failed to start ONNX Runtime session with CUDA. Falling back to CPU...")
-                device = torch.device("cpu")
-                cuda = False
-            LOGGER.info(f"Preferring ONNX Runtime {providers[0]}")
-            if onnx:
-                session = onnxruntime.InferenceSession(w, providers=providers)
-            else:
-                check_requirements(
-                    ["model-compression-toolkit==2.1.1", "sony-custom-layers[torch]==0.2.0", "onnxruntime-extensions"]
-                )
-                w = next(Path(w).glob("*.onnx"))
-                LOGGER.info(f"Loading {w} for ONNX IMX inference...")
-                import mct_quantizers as mctq
-                from sony_custom_layers.pytorch.object_detection import nms_ort  # noqa
-
-                session = onnxruntime.InferenceSession(
-                    w, mctq.get_ort_session_options(), providers=["CPUExecutionProvider"]
-                )
-                task = "detect"
-
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if cuda else ["CPUExecutionProvider"]
+            session = onnxruntime.InferenceSession(w, providers=providers)
             output_names = [x.name for x in session.get_outputs()]
             metadata = session.get_modelmeta().custom_metadata_map
-            dynamic = isinstance(session.get_outputs()[0].shape[0], str)
-            if not dynamic:
-                io = session.io_binding()
-                bindings = []
-                for output in session.get_outputs():
-                    y_tensor = torch.empty(output.shape, dtype=torch.float16 if fp16 else torch.float32).to(device)
-                    io.bind_output(
-                        name=output.name,
-                        device_type=device.type,
-                        device_id=device.index if cuda else 0,
-                        element_type=np.float16 if fp16 else np.float32,
-                        shape=tuple(y_tensor.shape),
-                        buffer_ptr=y_tensor.data_ptr(),
-                    )
-                    bindings.append(y_tensor)
 
         # OpenVINO
         elif xml:
@@ -421,26 +382,6 @@ class AutoBackend(nn.Module):
             output_names = predictor.get_output_names()
             metadata = w.parents[1] / "metadata.yaml"
 
-        # MNN
-        elif mnn:
-            LOGGER.info(f"Loading {w} for MNN inference...")
-            check_requirements("MNN")  # requires MNN
-            import os
-
-            import MNN
-
-            config = {}
-            config["precision"] = "low"
-            config["backend"] = "CPU"
-            config["numThread"] = (os.cpu_count() + 1) // 2
-            rt = MNN.nn.create_runtime_manager((config,))
-            net = MNN.nn.load_module_from_file(w, [], [], runtime_manager=rt, rearrange=True)
-
-            def torch_to_mnn(x):
-                return MNN.expr.const(x.data_ptr(), x.shape)
-
-            metadata = json.loads(net.get_info()["bizCode"])
-
         # NCNN
         elif ncnn:
             LOGGER.info(f"Loading {w} for NCNN inference...")
@@ -536,26 +477,9 @@ class AutoBackend(nn.Module):
             y = self.net.forward()
 
         # ONNX Runtime
-        elif self.onnx or self.imx:
-            if self.dynamic:
-                im = im.cpu().numpy()  # torch to numpy
-                y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
-            else:
-                if not self.cuda:
-                    im = im.cpu()
-                self.io.bind_input(
-                    name="images",
-                    device_type=im.device.type,
-                    device_id=im.device.index if im.device.type == "cuda" else 0,
-                    element_type=np.float16 if self.fp16 else np.float32,
-                    shape=tuple(im.shape),
-                    buffer_ptr=im.data_ptr(),
-                )
-                self.session.run_with_iobinding(self.io)
-                y = self.bindings
-            if self.imx:
-                # boxes, conf, cls
-                y = np.concatenate([y[0], y[1][:, :, None], y[2][:, :, None]], axis=-1)
+        elif self.onnx:
+            im = im.cpu().numpy()  # torch to numpy
+            y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
 
         # OpenVINO
         elif self.xml:
@@ -631,12 +555,6 @@ class AutoBackend(nn.Module):
             self.predictor.run()
             y = [self.predictor.get_output_handle(x).copy_to_cpu() for x in self.output_names]
 
-        # MNN
-        elif self.mnn:
-            input_var = self.torch_to_mnn(im)
-            output_var = self.net.onForward([input_var])
-            y = [x.read() for x in output_var]
-
         # NCNN
         elif self.ncnn:
             mat_in = self.pyncnn.Mat(im[0].cpu().numpy())
@@ -668,24 +586,60 @@ class AutoBackend(nn.Module):
                 self.interpreter.set_tensor(details["index"], im)
                 self.interpreter.invoke()
                 y = []
+                
+                final_output = []
                 for output in self.output_details:
                     x = self.interpreter.get_tensor(output["index"])
                     if is_int:
                         scale, zero_point = output["quantization"]
                         x = (x.astype(np.float32) - zero_point) * scale  # re-scale
-                    if x.ndim == 3:  # if task is not classification, excluding masks (ndim=4) as well
-                        # Denormalize xywh by image size. See https://github.com/ultralytics/ultralytics/pull/1695
-                        # xywh are normalized in TFLite/EdgeTPU to mitigate quantization error of integer models
-                        if x.shape[-1] == 6:  # end-to-end model
-                            x[:, :, [0, 2]] *= w
-                            x[:, :, [1, 3]] *= h
-                        else:
-                            x[:, [0, 2]] *= w
-                            x[:, [1, 3]] *= h
-                            if self.task == "pose":
-                                x[:, 5::3] *= w
-                                x[:, 6::3] *= h
-                    y.append(x)
+                        if x.shape[1] == 4:
+                            print(x)
+                    # if x.ndim == 3:  # if task is not classification, excluding masks (ndim=4) as well
+                    #     # Denormalize xywh by image size. See https://github.com/ultralytics/ultralytics/pull/1695
+                    #     # xywh are normalized in TFLite/EdgeTPU to mitigate quantization error of integer models
+                    #     if x.shape[-1] == 6:  # end-to-end model
+                    #         x[:, :, [0, 2]] *= w
+                    #         x[:, :, [1, 3]] *= h
+                    #     else:
+                    #         x[:, [0, 2]] *= w
+                    #         x[:, [1, 3]] *= h
+                    #         if self.task == "pose":
+                    #             x[:, 5::3] *= w
+                    #             x[:, 6::3] *= h
+                    # y.append(x)
+                    
+                    anchors = torch.tensor(np.load("anchors.npy"))
+                    strides = torch.tensor(np.load("strides.npy"))
+                    stride = torch.tensor([8, 16, 32])
+                    if x.shape[1] == 4: # bboxes
+                        grid_w = 32
+                        grid_h = 32
+                        grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h]).reshape(1, 4, 1)
+                        norm = strides / (stride[0] * grid_size)
+                        # np.savetxt("norm_m256.csv", norm[0].cpu().numpy(), delimiter=",")
+                        # print(x)
+
+                        x = dist2bbox(torch.tensor(x) * norm, anchors.unsqueeze(0) * norm[:, :2], xywh=True, dim=1)
+                        x[:, [0, 2]] *= w
+                        x[:, [1, 3]] *= h
+
+                    if x.shape[1] == 51:
+                        # decode kpts
+                        kpts = torch.tensor(x)
+                        bs = 1
+                        y = kpts.reshape(bs, 17, 3, -1)
+                        grid_h, grid_w = 32, 32
+                        grid_size = torch.tensor([grid_w, grid_h]).reshape(1, 2, 1)
+                        norm = strides / (stride[0] * grid_size)
+                        a = (y[:, :, :2] * 2.0 + (anchors - 0.5)) * norm
+                        a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+                        a[:, :, 0] *= w
+                        a[:, :, 1] *= h
+                        x = a.view(bs, 17*3, -1).numpy()
+                    final_output.append(x)
+                y = [np.concatenate(final_output, axis=1)]
+
             # TF segment fixes: export is reversed vs ONNX export and protos are transposed
             if len(y) == 2:  # segment with (det, proto) output order reversed
                 if len(y[1].shape) != 4:

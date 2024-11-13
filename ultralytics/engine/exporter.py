@@ -457,7 +457,8 @@ class Exporter:
         LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__} opset {opset_version}...")
         f = str(self.file.with_suffix(".onnx"))
 
-        output_names = ["output0", "output1"] if isinstance(self.model, SegmentationModel) else ["output0"]
+        # output_names = ["output0", "output1"] if isinstance(self.model, SegmentationModel) else ["output0"]
+        output_names = ["output0", "output1", "output2"]
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
@@ -1273,9 +1274,20 @@ class Exporter:
 
         # Create output info
         output1 = schema.TensorMetadataT()
-        output1.name = "output"
+        output1.name = "output1"
         output1.description = "Coordinates of detected objects, class labels, and confidence score"
         output1.associatedFiles = [label_file]
+
+        output2 = schema.TensorMetadataT()
+        output2.name = "output2"
+        output2.description = "Coordinates of detected objects, class labels, and confidence score"
+        output2.associatedFiles = [label_file]
+
+        output3 = schema.TensorMetadataT()
+        output3.name = "output3"
+        output3.description = "Coordinates of detected objects, class labels, and confidence score"
+        output3.associatedFiles = [label_file]
+        
         if self.model.task == "segment":
             output2 = schema.TensorMetadataT()
             output2.name = "output"
@@ -1285,7 +1297,8 @@ class Exporter:
         # Create subgraph info
         subgraph = schema.SubGraphMetadataT()
         subgraph.inputTensorMetadata = [input_meta]
-        subgraph.outputTensorMetadata = [output1, output2] if self.model.task == "segment" else [output1]
+        # subgraph.outputTensorMetadata = [output1, output2] if self.model.task == "segment" else [output1]
+        subgraph.outputTensorMetadata = [output1, output2, output3]
         model_meta.subgraphMetadata = [subgraph]
 
         b = flatbuffers.Builder(0)
